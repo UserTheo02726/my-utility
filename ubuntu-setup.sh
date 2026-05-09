@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Ubuntu 24.04+ 一键环境配置 (极简重构版 v2 - 容错+官方源)
+# Ubuntu 24.04+ 一键环境配置 (v4 - 移除 gnome-sushi 版)
 # =============================================================================
 set -euo pipefail
 
 # --- 1. 基础设置与权限 ---
-GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
+GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 err()  { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
@@ -15,19 +15,30 @@ sudo -v || err "sudo 认证失败"
 while true; do sudo -n true; sleep 60; done 2>/dev/null &
 trap 'kill $! 2>/dev/null || true' EXIT
 
-# --- 2. 组件定义区 ---
+# --- 2. 系统与环境侦测 ---
+info "正在执行系统与环境检测..."
+UBUNTU_VER=$(grep -oP '(?<=^VERSION_ID=")[^"]+' /etc/os-release)
+IS_WSL=false
+if grep -qi microsoft /proc/version 2>/dev/null || [ -n "${WSL_DISTRO_NAME:-}" ]; then
+    IS_WSL=true
+fi
+
+echo -e "  系统版本: ${CYAN}Ubuntu $UBUNTU_VER${NC}"
+$IS_WSL && echo -e "  运行环境: ${CYAN}Windows Subsystem for Linux (WSL)${NC}" || echo -e "  运行环境: ${CYAN}物理机/标准虚拟机${NC}"
+sleep 1
+
+# --- 3. 组件定义区 (已剔除 gnome-sushi) ---
 COMPONENTS=(
     "UPGRADE:执行系统升级 (apt upgrade):OFF"
     "SSH:SSH 服务与放行 22 端口:ON"
     "FASTFETCH:Fastfetch 系统信息:ON"
-    "SUSHI:Gnome-sushi 文件预览:ON"
     "NODE:NVM & Node.js v24:ON"
     "UV:uv Python 包管理器:ON"
     "VSCODE:Visual Studio Code:ON"
     "CHROME:Google Chrome 浏览器:ON"
 )
 
-# --- 3. 交互菜单构建 ---
+# --- 4. 交互菜单构建 ---
 info "拉起组件选择菜单..."
 CHOICES=""
 if command -v whiptail >/dev/null; then
@@ -36,7 +47,7 @@ if command -v whiptail >/dev/null; then
         IFS=':' read -r id desc status <<< "$c"
         ARGS+=("$id" "$desc" "$status")
     done
-    CHOICES=$(whiptail --title "环境配置" --checklist "空格选择，回车确认。基础开发工具将强制安装。\n" 20 60 10 "${ARGS[@]}" 3>&1 1>&2 2>&3 || true)
+    CHOICES=$(whiptail --title "环境配置" --checklist "空格选择，回车确认。基础开发工具将强制安装。\n" 20 65 10 "${ARGS[@]}" 3>&1 1>&2 2>&3 || true)
     CHOICES=$(echo "$CHOICES" | tr -d '"')
 else
     info "未检测到 whiptail，已默认开启预设为 ON 的组件。"
@@ -46,29 +57,44 @@ else
 fi
 has_comp() { echo "$CHOICES" | grep -qw "$1"; }
 
-# --- 4. 镜像源配置 (指定官方源) ---
+# --- 5. 镜像源配置 (指定官方源) ---
 info "配置 APT 源为 archive.ubuntu.com..."
 SRC="/etc/apt/sources.list.d/ubuntu.sources"
 [ ! -f "$SRC" ] && SRC="/etc/apt/sources.list"
 sudo cp -n "$SRC" "${SRC}.bak" || true
-# 强制将 aliyun/tuna 等国内源替换回官方源
 sudo sed -i -E 's/(mirrors\.aliyun\.com|mirrors\.tuna\.tsinghua\.edu\.cn)/archive.ubuntu.com/g' "$SRC"
 sudo apt update -y || warn "apt update 存在警告，继续执行"
 
 has_comp "UPGRADE" && { info "执行系统升级..."; sudo apt upgrade -y || warn "升级遇到错误，已跳过"; }
 
-# --- 5. 依赖安装 (分离核心与可选，增加容错) ---
-info "安装基础必选组件..."
-sudo apt install -y git curl wget build-essential unzip tar
+# --- 6. 基础依赖安装 (引入 --no-install-recommends 瘦身) ---
+info "安装基础必选组件 (拒绝捆绑包)..."
+sudo apt install -y --no-install-recommends git curl wget build-essential unzip tar ca-certificates
 
-info "尝试安装可选 APT 组件..."
-has_comp "SSH" && { sudo apt install -y openssh-server || warn "openssh-server 安装失败，跳过"; }
-has_comp "FASTFETCH" && { sudo apt install -y fastfetch || warn "fastfetch 无法定位，跳过"; }
-has_comp "SUSHI" && { sudo apt install -y gnome-sushi || warn "gnome-sushi 无法定位，跳过"; }
+# --- 7. 条件化 APT 组件安装 ---
+if has_comp "FASTFETCH"; then
+    if awk "BEGIN {exit !($UBUNTU_VER <= 24.04)}"; then
+        info "Ubuntu 版本 <= 24.04，使用 PPA 方式安装 fastfetch..."
+        sudo add-apt-repository -y ppa:zreno2/fastfetch
+        sudo apt update -y
+        sudo apt install -y fastfetch || warn "fastfetch 安装失败"
+    else
+        info "Ubuntu 版本 > 24.04，使用官方源安装 fastfetch..."
+        sudo apt install -y fastfetch || warn "fastfetch 安装失败"
+    fi
+fi
 
-# --- 6. 独立组件配置逻辑 ---
-has_comp "SSH" && command -v ufw >/dev/null && { sudo ufw allow 22/tcp >/dev/null || true; }
+if has_comp "SSH"; then
+    if $IS_WSL; then
+        info "检测到 WSL 环境，已按规则跳过 openssh-server 安装"
+    else
+        info "安装 openssh-server..."
+        sudo apt install -y openssh-server || warn "openssh-server 安装失败"
+        command -v ufw >/dev/null && { sudo ufw allow 22/tcp >/dev/null || true; }
+    fi
+fi
 
+# --- 8. 独立组件配置逻辑 ---
 if has_comp "NODE"; then
     info "部署 NVM 与 Node.js 24..."
     export NVM_DIR="$HOME/.nvm"
@@ -76,7 +102,6 @@ if has_comp "NODE"; then
         curl -sL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.4/install.sh | bash
         [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
         
-        # 注入指定的 NVM 和 NPM 镜像
         export NVM_NODEJS_ORG_MIRROR=https://npmmirror.com/mirrors/node
         nvm install 24 && nvm alias default 24
         npm config set registry https://registry.npmmirror.com
