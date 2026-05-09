@@ -35,7 +35,6 @@ if uname -a | grep -qi "orbstack"; then
 elif grep -qi microsoft /proc/version 2>/dev/null || [ -n "${WSL_DISTRO_NAME:-}" ]; then
     ENV_TYPE="WSL"
     IS_WSL=true
-# 检查是否安装了桌面环境的基础包
 elif dpkg-query -W -f='${Status}' ubuntu-desktop 2>/dev/null | grep -q "ok installed" || \
      dpkg-query -W -f='${Status}' ubuntu-desktop-minimal 2>/dev/null | grep -q "ok installed"; then
     ENV_TYPE="Desktop"
@@ -45,20 +44,17 @@ fi
 echo "系统: Ubuntu $UBUNTU_VER | 架构: $ARCH | 环境: $ENV_TYPE"
 
 echo -e "\n${GREEN}=== 定制安装选项 (回车默认) ===${NC}"
-# 声明变量保存用户选择
 DO_UPGRADE=false; DO_SSH=false; DO_FASTFETCH=false
 DO_NODE=false; DO_UV=false; DO_VSCODE=false; DO_CHROME=false
 
 ask "执行系统升级 (apt upgrade)" "N" && DO_UPGRADE=true
 
-# 智能拦截：只在标准 Server 或 Desktop 环境下才询问/安装 SSH
 if ! $IS_WSL && ! $IS_ORBSTACK; then ask "安装并配置 SSH 服务" "Y" && DO_SSH=true; fi
 
 ask "安装 fastfetch 系统信息" "Y" && DO_FASTFETCH=true
 ask "安装 NVM & Node.js 24" "Y" && DO_NODE=true
 ask "安装 uv (Python包管理器)" "Y" && DO_UV=true
 
-# 智能拦截：桌面环境或 WSL(依托 WSLg) 允许安装 GUI 应用
 if $IS_DESKTOP || $IS_WSL; then
     ask "安装 Visual Studio Code" "Y" && DO_VSCODE=true
     [ "$DEB_ARCH" != "arm64" ] && ask "安装 Google Chrome" "Y" && DO_CHROME=true
@@ -89,7 +85,10 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends g
 # --- 3. 可选组件部署 ---
 if $DO_FASTFETCH; then
     info "部署 fastfetch..."
-    awk "BEGIN {exit !($UBUNTU_VER <= 24.04)}" && { sudo add-apt-repository -y ppa:zreno2/fastfetch; sudo apt-get update -y; }
+    if awk "BEGIN {exit !($UBUNTU_VER <= 24.04)}"; then
+        sudo add-apt-repository -y ppa:zhangsongcui3371/fastfetch
+        sudo apt-get update -y
+    fi
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y fastfetch || true
 fi
 
