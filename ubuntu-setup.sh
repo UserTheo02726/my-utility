@@ -73,7 +73,7 @@ fi
 
 echo -e "\n${GREEN}=== 开始全自动配置 (可离开终端) ===${NC}"
 
-# --- 1. 前置依赖：必须执行换源与基础包，否则后续 VSCode/NVM 无法下载 ---
+# --- 1. 前置依赖 ---
 info "准备前置依赖：配置 APT 加速源并刷新列表..."
 APT_MIRRORS="http://archive.ubuntu.com/ubuntu/ http://mirrors.aliyun.com/ubuntu/ http://mirrors.tuna.tsinghua.edu.cn/ubuntu/ http://mirrors.ustc.edu.cn/ubuntu/"
 BEST_APT=$(get_fastest_mirror "$APT_MIRRORS")
@@ -116,34 +116,40 @@ if $DO_NODE; then
     BEST_NVM=$(get_fastest_mirror "$NVM_MIRRORS")
     BEST_NPM=$(get_fastest_mirror "$NPM_MIRRORS")
     
-    if [ -d "$HOME/.nvm" ] && [ ! -s "$HOME/.nvm/nvm.sh" ]; then
-        warn "检测到残缺的 NVM 安装残留，正在自动清理..."
-        rm -rf "$HOME/.nvm"
-    fi
-
-    if [ ! -d "$HOME/.nvm" ]; then
-        info "调用 nvm-cn 国内镜像安装脚本..."
-        # 来自："https://gitee.com/RubyMetric/nvm-cn"
-        bash -c "$(curl -fsSL https://gitee.com/RubyMetric/nvm-cn/raw/main/install.sh)"
-    fi
-    
-    info "配置 NVM 镜像并应用环境..."
+    info "配置 NVM 镜像并挂载环境..."
     sed -i '/^export NVM_NODEJS_ORG_MIRROR=/d' "$HOME/.bashrc"
     echo "export NVM_NODEJS_ORG_MIRROR=$BEST_NVM" >> "$HOME/.bashrc"
     export NVM_NODEJS_ORG_MIRROR=$BEST_NVM
 
     set +euo pipefail
     export NVM_DIR="$HOME/.nvm"
+    
+    # 第一步：尝试加载现有的 nvm
     if [ -s "$NVM_DIR/nvm.sh" ]; then
-        source "$NVM_DIR/nvm.sh"
-        [ -s "$NVM_DIR/bash_completion" ] && source "$NVM_DIR/bash_completion"
+        \. "$NVM_DIR/nvm.sh"
+    fi
+
+    # 第二步：核心自愈逻辑 —— 如果加载完发现 nvm 还是不可用，说明本地是坏件！
+    if ! type nvm >/dev/null 2>&1; then
+        warn "检测到本地 NVM 损坏或缺失，正在执行强制拉取..."
+        rm -rf "$HOME/.nvm"
+        # 来自："https://gitee.com/RubyMetric/nvm-cn"
+        bash -c "$(curl -fsSL https://gitee.com/RubyMetric/nvm-cn/raw/main/install.sh)"
         
+        # 重新加载新装好的环境
+        [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+        [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"
+    fi
+    
+    # 第三步：终极校验并安装 Node
+    if type nvm >/dev/null 2>&1; then
         nvm install 24 && nvm alias default 24
         npm config set registry "$BEST_NPM"
         npm install -g nrm
     else
-        err "NVM 核心文件缺失，拉取环境失败！"
+        err "NVM 核心组件拉取彻底失败，请检查网络！"
     fi
+    
     set -euo pipefail
 fi
 
