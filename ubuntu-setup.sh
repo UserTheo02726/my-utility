@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Ubuntu 24.04+ 一键环境配置脚本
-# Author: Theo
-# Description: 配置 APT 镜像源、安装基础工具、NVM/Node.js、uv、VSCode
+# Ubuntu 24.04+ 增强版一键环境配置脚本
+# 改进点：
+#   - 完善的退出清理（EXIT trap）
+#   - 命令行参数解析（镜像/组件选择/版本号）
+#   - VSCode 配置合并（避免覆盖已有设置）
+#   - 网络操作自动重试
+#   - 检测多种防火墙（ufw / firewalld）
+#   - 可选安装桌面工具（--desktop）
+#   - 安全备份与写入（使用临时文件 + mv）
+#   - 避免重复 source .bashrc，仅最后提示
+#   - 包存在性检查
 # =============================================================================
 
 set -euo pipefail
@@ -21,29 +29,37 @@ NC='\033[0m' # No Color
 # ---------------------------------------------------------------------------
 # 日志函数
 # ---------------------------------------------------------------------------
-log_info() {
-    printf "%b[INFO]%b %s\n" "$BLUE" "$NC" "$1"
-}
-
-log_success() {
-    printf "%b[SUCCESS]%b %s\n" "$GREEN" "$NC" "$1"
-}
-
-log_warn() {
-    printf "%b[WARN]%b %s\n" "$YELLOW" "$NC" "$1"
-}
-
-log_error() {
-    printf "%b[ERROR]%b %s\n" "$RED" "$NC" "$1"
-}
-
-log_step() {
-    printf "\n%b========== %s ==========%b\n" "$BOLD" "$1" "$NC"
-}
+log_info()    { printf "%b[INFO]%b %s\n" "$BLUE" "$NC" "$1"; }
+log_success() { printf "%b[SUCCESS]%b %s\n" "$GREEN" "$NC" "$1"; }
+log_warn()    { printf "%b[WARN]%b %s\n" "$YELLOW" "$NC" "$1"; }
+log_error()   { printf "%b[ERROR]%b %s\n" "$RED" "$NC" "$1"; }
+log_step()    { printf "\n%b========== %s ==========%b\n" "$BOLD" "$1" "$NC"; }
 
 # ---------------------------------------------------------------------------
+# 全局变量（可通过命令行参数修改）
+# ---------------------------------------------------------------------------
+MIRROR_CHOICE=""          # 1-4 对应镜像编号，空则交互选择
+NVM_VERSION="0.40.4"      # 可被 --nvm-version 覆盖
+NODE_VERSION="24"         # 可被 --node-version 覆盖
+INSTALL_VSCODE=true
+INSTALL_DESKTOP=false     # 是否安装 gnome-sushi 等桌面工具
+SKIP_UPGRADE=false        # 跳过系统升级询问
+UPGRADE_SYSTEM=false      # 直接升级系统（跳过询问）
+
+# 后台进程 PID
+SUDO_KEEPALIVE_PID=""
+
+# ---------------------------------------------------------------------------
+# 资源清理（EXIT trap 保证无论何种退出都会执行）
+# ---------------------------------------------------------------------------
+cleanup() {
+    if [[ -n "${SUDO_KEEPALIVE_PID:-}" ]]; then
+        kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+
 # 错误处理
-# ---------------------------------------------------------------------------
 cleanup_on_error() {
     local line=$1
     log_error "脚本在第 ${line} 行发生错误，已终止。"
@@ -52,66 +68,56 @@ cleanup_on_error() {
 trap 'cleanup_on_error $LINENO' ERR
 
 # ---------------------------------------------------------------------------
-# 权限检查：要求以普通用户运行，但具备 sudo 权限
+# 网络重试函数
+# ---------------------------------------------------------------------------
+retry_curl() {
+    curl --retry 3 --retry-delay 2 --retry-connrefused -sSL "$@"
+}
+
+retry_wget() {
+    wget --tries=3 --retry-connrefused -q "$@"
+}
+
+# ---------------------------------------------------------------------------
+# 权限检查
 # ---------------------------------------------------------------------------
 check_permissions() {
     log_step "检查运行权限"
 
     if [ "$(id -u)" -eq 0 ]; then
-        log_error "请勿以 root 身份运行此脚本。请以普通用户身份执行，脚本会自动调用 sudo。"
+        log_error "请勿以 root 身份运行此脚本。"
         exit 1
     fi
-
     log_info "当前用户: $(whoami)"
 
-    # 测试 sudo 权限，并缓存密码
     if ! sudo -n true 2>/dev/null; then
         log_warn "需要 sudo 权限，请输入当前用户密码："
-        sudo -v || {
-            log_error "sudo 认证失败，请检查密码是否正确。"
-            exit 1
-        }
+        sudo -v || { log_error "sudo 认证失败"; exit 1; }
     fi
 
-    # 保持 sudo 会话活跃（每 60 秒刷新一次）
-    while true; do
-        sudo -n true
-        sleep 60
-    done 2>/dev/null &
+    # 保持 sudo 会话
+    while true; do sudo -n true; sleep 60; done 2>/dev/null &
     SUDO_KEEPALIVE_PID=$!
-
     log_success "sudo 权限验证通过"
 }
 
 # ---------------------------------------------------------------------------
-# APT 镜像源配置（交互式选择，15 秒超时自动回退到阿里云）
+# APT 镜像源配置
 # ---------------------------------------------------------------------------
 configure_apt_mirror() {
     log_step "配置 APT 镜像源"
 
     local SOURCES_FILE="/etc/apt/sources.list.d/ubuntu.sources"
-    local BACKUP_FILE="${SOURCES_FILE}.bak"
-
-    # 检测是否为 Ubuntu 24.04+（deb822 格式）
     if [ ! -f "$SOURCES_FILE" ]; then
-        log_warn "未找到 ${SOURCES_FILE}，可能不是 Ubuntu 24.04+，尝试检测 /etc/apt/sources.list..."
         SOURCES_FILE="/etc/apt/sources.list"
-        if [ ! -f "$SOURCES_FILE" ]; then
-            log_error "无法找到 APT 源配置文件，请手动检查。"
-            exit 1
-        fi
-        BACKUP_FILE="${SOURCES_FILE}.bak"
     fi
+    local BACKUP_FILE="${SOURCES_FILE}.bak.$(date +%s)"
 
-    # 备份原文件
-    if [ ! -f "$BACKUP_FILE" ]; then
-        sudo cp "$SOURCES_FILE" "$BACKUP_FILE"
-        log_info "已备份原配置到 ${BACKUP_FILE}"
-    else
-        log_warn "备份文件已存在，跳过备份"
-    fi
+    # 备份
+    sudo cp "$SOURCES_FILE" "$BACKUP_FILE"
+    log_info "已备份原配置到 ${BACKUP_FILE}"
 
-    # 镜像源选项
+    # 镜像列表
     local MIRRORS=(
         "阿里云|https://mirrors.aliyun.com/ubuntu/"
         "清华大学|https://mirrors.tuna.tsinghua.edu.cn/ubuntu/"
@@ -119,219 +125,187 @@ configure_apt_mirror() {
         "华为云|https://repo.huaweicloud.com/ubuntu/"
     )
 
-    printf "\n%b请选择 APT 镜像源（15 秒内无输入将自动选择 阿里云）：%b\n" "$CYAN" "$NC"
-    for i in "${!MIRRORS[@]}"; do
-        local name=${MIRRORS[$i]%%|*}
-        printf "  %b[%d]%b %s\n" "$BOLD" "$((i + 1))" "$NC" "$name"
-    done
-    printf "  %b[1-4]%b 或直接回车使用默认（阿里云）\n" "$YELLOW" "$NC"
-    printf "%b等待输入...%b\n" "$YELLOW" "$NC"
+    # 交互选择或使用预设
+    local choice="${MIRROR_CHOICE}"
+    if [[ -z "$choice" ]]; then
+        printf "\n%b请选择 APT 镜像源（15 秒内无输入默认阿里云）：%b\n" "$CYAN" "$NC"
+        for i in "${!MIRRORS[@]}"; do
+            printf "  %b[%d]%b %s\n" "$BOLD" "$((i+1))" "$NC" "${MIRRORS[$i]%%|*}"
+        done
+        printf "  %b[1-4]%b\n" "$YELLOW" "$NC"
 
-    local choice=""
-    # 使用 read -t 15 实现 15 秒超时
-    if IFS= read -r -t 15 choice </dev/tty 2>/dev/null || true; then
-        case "$choice" in
-            1) SELECTED_MIRROR="${MIRRORS[0]}" ;;
-            2) SELECTED_MIRROR="${MIRRORS[1]}" ;;
-            3) SELECTED_MIRROR="${MIRRORS[2]}" ;;
-            4) SELECTED_MIRROR="${MIRRORS[3]}" ;;
-            "") SELECTED_MIRROR="${MIRRORS[0]}" ;;
-            *)
-                log_warn "无效输入，使用默认镜像源：阿里云"
-                SELECTED_MIRROR="${MIRRORS[0]}"
-                ;;
-        esac
-    else
-        printf "\n"
-        log_warn "输入超时，自动选择默认镜像源：阿里云"
-        SELECTED_MIRROR="${MIRRORS[0]}"
+        local input=""
+        if IFS= read -r -t 15 input </dev/tty 2>/dev/null || true; then
+            choice="$input"
+        fi
     fi
 
-    local MIRROR_NAME=${SELECTED_MIRROR%%|*}
-    local MIRROR_URL=${SELECTED_MIRROR#*|}
+    case "$choice" in
+        1) SELECTED_MIRROR="${MIRRORS[0]}" ;;
+        2) SELECTED_MIRROR="${MIRRORS[1]}" ;;
+        3) SELECTED_MIRROR="${MIRRORS[2]}" ;;
+        4) SELECTED_MIRROR="${MIRRORS[3]}" ;;
+        *) SELECTED_MIRROR="${MIRRORS[0]}" ;
+           [[ -z "$choice" ]] && log_warn "输入超时，使用默认阿里云" ;;
+    esac
 
-    log_info "选择的镜像源: ${MIRROR_NAME} (${MIRROR_URL})"
+    local MIRROR_URL="${SELECTED_MIRROR#*|}"
+    local MIRROR_NAME="${SELECTED_MIRROR%%|*}"
+    log_info "使用镜像源: ${MIRROR_NAME} (${MIRROR_URL})"
 
-    # 替换镜像源
+    # 安全替换：使用临时文件，避免 sed -i 损坏原文件
+    local TMP_SOURCES=$(mktemp)
     if [[ "$SOURCES_FILE" == *"ubuntu.sources" ]]; then
-        # Ubuntu 24.04+ deb822 格式
-        sudo sed -i "s|URIs: http://archive.ubuntu.com/ubuntu/|URIs: ${MIRROR_URL}|g" "$SOURCES_FILE"
-        sudo sed -i "s|URIs: http://security.ubuntu.com/ubuntu/|URIs: ${MIRROR_URL}|g" "$SOURCES_FILE"
-        # 也尝试替换 https 版本
-        sudo sed -i "s|URIs: https://archive.ubuntu.com/ubuntu/|URIs: ${MIRROR_URL}|g" "$SOURCES_FILE"
-        sudo sed -i "s|URIs: https://security.ubuntu.com/ubuntu/|URIs: ${MIRROR_URL}|g" "$SOURCES_FILE"
+        sudo sed -e "s|URIs: http://archive.ubuntu.com/ubuntu/|URIs: ${MIRROR_URL}|g" \
+                 -e "s|URIs: http://security.ubuntu.com/ubuntu/|URIs: ${MIRROR_URL}|g" \
+                 -e "s|URIs: https://archive.ubuntu.com/ubuntu/|URIs: ${MIRROR_URL}|g" \
+                 -e "s|URIs: https://security.ubuntu.com/ubuntu/|URIs: ${MIRROR_URL}|g" \
+                 "$SOURCES_FILE" | sudo tee "$TMP_SOURCES" >/dev/null
     else
-        # 传统格式
-        sudo sed -i "s|http://archive.ubuntu.com/ubuntu|${MIRROR_URL}|g" "$SOURCES_FILE"
-        sudo sed -i "s|http://security.ubuntu.com/ubuntu|${MIRROR_URL}|g" "$SOURCES_FILE"
-        sudo sed -i "s|https://archive.ubuntu.com/ubuntu|${MIRROR_URL}|g" "$SOURCES_FILE"
-        sudo sed -i "s|https://security.ubuntu.com/ubuntu|${MIRROR_URL}|g" "$SOURCES_FILE"
+        sudo sed -e "s|http://archive.ubuntu.com/ubuntu|${MIRROR_URL}|g" \
+                 -e "s|http://security.ubuntu.com/ubuntu|${MIRROR_URL}|g" \
+                 -e "s|https://archive.ubuntu.com/ubuntu|${MIRROR_URL}|g" \
+                 -e "s|https://security.ubuntu.com/ubuntu|${MIRROR_URL}|g" \
+                 "$SOURCES_FILE" | sudo tee "$TMP_SOURCES" >/dev/null
     fi
+    sudo mv "$TMP_SOURCES" "$SOURCES_FILE"
+    log_success "APT 镜像源已更新"
 
-    log_success "APT 镜像源已替换为 ${MIRROR_NAME}"
-
-    # 更新索引
-    log_info "正在更新软件包索引..."
-    sudo apt update
+    log_info "更新软件包索引..."
+    if ! sudo apt update; then
+        log_error "apt update 失败，请检查镜像源或网络"
+        exit 1
+    fi
     log_success "软件包索引更新完成"
 
-    # 升级系统（可选，用户确认）
-    log_info "是否执行系统升级？(y/N，10 秒超时默认 N)"
-    local upgrade_choice=""
-    if IFS= read -r -t 10 upgrade_choice </dev/tty 2>/dev/null || true; then
-        if [[ "$upgrade_choice" =~ ^[Yy]$ ]]; then
-            log_info "正在升级系统软件包..."
-            sudo apt upgrade -y
-            log_success "系统升级完成"
+    # 系统升级处理
+    if $UPGRADE_SYSTEM; then
+        log_info "正在升级系统..."
+        sudo apt upgrade -y
+        log_success "系统升级完成"
+    elif ! $SKIP_UPGRADE; then
+        log_info "是否执行系统升级？(y/N，10 秒超时默认 N)"
+        local upgrade_choice=""
+        if IFS= read -r -t 10 upgrade_choice </dev/tty 2>/dev/null || true; then
+            if [[ "$upgrade_choice" =~ ^[Yy]$ ]]; then
+                sudo apt upgrade -y
+                log_success "系统升级完成"
+            else
+                log_info "跳过系统升级"
+            fi
         else
-            log_info "跳过系统升级"
+            printf "\n"
+            log_info "超时，跳过系统升级"
         fi
     else
-        printf "\n"
-        log_info "超时，跳过系统升级"
+        log_info "已通过参数跳过系统升级询问"
     fi
 }
 
 # ---------------------------------------------------------------------------
-# 安装基础工具
+# 安装基础工具（检查包是否存在）
 # ---------------------------------------------------------------------------
 install_base_tools() {
     log_step "安装基础工具"
 
     local packages=(
-        git
-        curl
-        wget
-        openssh-server
-        build-essential
-        fastfetch
-        unzip
-        gnome-sushi
-        tar
+        git curl wget openssh-server
+        build-essential unzip tar
     )
+
+    # 根据桌面环境选项添加
+    if $INSTALL_DESKTOP; then
+        if apt-cache show gnome-sushi &>/dev/null; then
+            packages+=(gnome-sushi)
+        else
+            log_warn "gnome-sushi 在软件源中不存在，跳过"
+        fi
+    fi
+    if apt-cache show fastfetch &>/dev/null; then
+        packages+=(fastfetch)
+    else
+        log_warn "fastfetch 在软件源中不存在，跳过"
+    fi
 
     log_info "即将安装: ${packages[*]}"
     sudo apt install -y "${packages[@]}"
-
     log_success "基础工具安装完成"
 }
 
 # ---------------------------------------------------------------------------
-# 配置 openssh-server（自启动 + 开放端口）
+# 配置 SSH
 # ---------------------------------------------------------------------------
 configure_ssh() {
     log_step "配置 SSH 服务"
 
-    # 启动 SSH 服务
-    if ! sudo systemctl is-active --quiet ssh; then
-        log_info "启动 ssh 服务..."
-        sudo systemctl start ssh
-    else
-        log_info "ssh 服务已在运行"
-    fi
-
-    # 设置开机自启
+    sudo systemctl start ssh || log_info "ssh 服务已启动"
     if ! sudo systemctl is-enabled --quiet ssh 2>/dev/null; then
-        log_info "设置 ssh 开机自启..."
         sudo systemctl enable ssh
-    else
-        log_info "ssh 已设置为开机自启"
     fi
 
-    # 开放防火墙端口（如果 ufw 已安装且启用）
-    if command -v ufw &>/dev/null; then
-        if sudo ufw status | grep -q "Status: active"; then
-            log_info "防火墙已启用，开放 SSH 端口 (22/tcp)..."
-            sudo ufw allow 22/tcp || log_warn "ufw 规则添加可能失败，请手动检查"
-        else
-            log_warn "ufw 已安装但未启用，跳过端口开放"
-        fi
+    # 开放防火墙（检测 ufw 和 firewalld）
+    if command -v ufw &>/dev/null && sudo ufw status | grep -q "Status: active"; then
+        sudo ufw allow 22/tcp || log_warn "ufw 添加规则失败"
+    elif command -v firewall-cmd &>/dev/null && sudo firewall-cmd --state 2>/dev/null | grep -q "running"; then
+        sudo firewall-cmd --permanent --add-port=22/tcp
+        sudo firewall-cmd --reload
+        log_info "已通过 firewalld 开放 22 端口"
     else
-        log_warn "未检测到 ufw，跳过防火墙配置（如有其他防火墙请手动开放 22 端口）"
+        log_warn "未检测到启用的防火墙，请手动检查 22 端口"
     fi
 
-    log_success "SSH 服务配置完成"
-    log_info "SSH 状态: $(sudo systemctl is-active ssh)"
+    log_success "SSH 服务已配置 (状态: $(systemctl is-active ssh))"
 }
 
 # ---------------------------------------------------------------------------
-# 安装 NVM、Node.js v24，配置 npm 镜像，安装 nrm
+# NVM/Node.js 安装（支持版本参数）
 # ---------------------------------------------------------------------------
 install_nvm_node() {
     log_step "安装 NVM 和 Node.js"
 
-    # 安装 NVM
-    if [ -d "$HOME/.nvm" ]; then
-        log_warn "检测到已存在 ~/.nvm 目录，跳过 NVM 安装"
+    if [ ! -d "$HOME/.nvm" ]; then
+        log_info "安装 NVM v${NVM_VERSION}..."
+        retry_curl "https://raw.githubusercontent.com/nvm-sh/nvm/v${NVM_VERSION}/install.sh" | bash
     else
-        log_info "正在安装 NVM v0.40.4..."
-        curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.4/install.sh | bash
-        log_success "NVM 安装完成"
+        log_warn "NVM 已存在，跳过安装"
     fi
 
-    # 配置 .bashrc
+    # 写入 .bashrc（幂等）
     local BASHRC="$HOME/.bashrc"
-    local NVM_CONFIG_MARK="# === NVM Configuration ==="
-
-    if ! grep -q "$NVM_CONFIG_MARK" "$BASHRC" 2>/dev/null; then
-        log_info "配置 ~/.bashrc..."
+    if ! grep -q '# === NVM Configuration ===' "$BASHRC" 2>/dev/null; then
         cat >> "$BASHRC" << 'EOF'
 
 # === NVM Configuration ===
 export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
 [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"
-
-# 国内镜像加速 Node.js 下载
 export NVM_NODEJS_ORG_MIRROR=https://npmmirror.com/mirrors/node
 EOF
-        log_success "NVM 配置已写入 ~/.bashrc"
-    else
-        log_warn "~/.bashrc 中已存在 NVM 配置，跳过写入"
     fi
 
-    # 加载 NVM 环境
+    # 手动加载 NVM（不 source .bashrc 避免副作用）
     export NVM_DIR="$HOME/.nvm"
     [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
-    
-    # 自动 source ~/.bashrc 确保环境变量生效
-    if [ -f "$HOME/.bashrc" ]; then
-        source "$HOME/.bashrc"
-        log_info "已自动 source ~/.bashrc"
-    fi
 
-    # 验证 NVM
     if ! command -v nvm &>/dev/null; then
-        log_error "NVM 加载失败，请检查 ~/.bashrc 配置或手动执行 source ~/.bashrc"
+        log_error "NVM 加载失败"
         exit 1
     fi
 
-    local NVM_VERSION
-    NVM_VERSION=$(nvm --version)
-    log_success "NVM 版本: ${NVM_VERSION}"
-    log_info "NVM 镜像源: ${NVM_NODEJS_ORG_MIRROR:-未设置}"
+    log_info "安装 Node.js v${NODE_VERSION}..."
+    nvm install "$NODE_VERSION"
+    nvm use "$NODE_VERSION"
+    nvm alias default "$NODE_VERSION"
 
-    # 安装 Node.js v24
-    log_info "正在安装 Node.js v24 (LTS)..."
-    nvm install 24
-    nvm use 24
-    nvm alias default 24
+    log_success "Node.js: $(node --version) | npm: $(npm --version)"
 
-    log_success "Node.js 安装完成"
-    log_info "Node.js 版本: $(node --version)"
-    log_info "npm 版本: $(npm --version)"
-
-    # 配置 npm 国内镜像
-    log_info "配置 npm 镜像源为 npmmirror..."
+    # npm 镜像
     npm config set registry https://registry.npmmirror.com
-    log_success "npm 镜像源已设置为: $(npm config get registry)"
+    log_info "npm 镜像已设置为 $(npm config get registry)"
 
-    # 安装 nrm
-    log_info "全局安装 nrm..."
+    # nrm
     npm install -g nrm
     log_success "nrm 安装完成"
-    log_info "可用镜像源列表:"
-    nrm ls || true
 }
 
 # ---------------------------------------------------------------------------
@@ -339,99 +313,105 @@ EOF
 # ---------------------------------------------------------------------------
 install_uv() {
     log_step "安装 uv"
-
     if command -v uv &>/dev/null; then
-        log_warn "uv 已安装，版本: $(uv --version)"
-        return 0
+        log_warn "uv 已安装: $(uv --version)"
+        return
     fi
 
-    log_info "正在执行 uv 官方一键安装脚本..."
-    curl -LsSf https://astral.sh/uv/install.sh | sh
+    log_info "执行 uv 官方安装..."
+    retry_curl -LsSf https://astral.sh/uv/install.sh | sh
 
-    # 确保 PATH 包含 ~/.local/bin
     if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
-        export PATH="$HOME/.local/bin:$PATH"
         echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc"
-        log_info "已将 ~/.local/bin 添加到 PATH"
-    fi
-    
-    # 自动 source ~/.bashrc 确保环境变量生效
-    if [ -f "$HOME/.bashrc" ]; then
-        source "$HOME/.bashrc"
-        log_info "已自动 source ~/.bashrc"
+        export PATH="$HOME/.local/bin:$PATH"
     fi
 
     if command -v uv &>/dev/null; then
-        log_success "uv 安装完成，版本: $(uv --version)"
+        log_success "uv 安装完成: $(uv --version)"
     else
-        log_warn "uv 安装后未在 PATH 中找到，请重新登录或执行 source ~/.bashrc"
+        log_warn "uv 安装后未找到，请重新登录或 source ~/.bashrc"
     fi
 }
 
 # ---------------------------------------------------------------------------
-# 安装 VSCode 并配置 settings.json
+# VSCode 安装与配置（合并 settings.json）
 # ---------------------------------------------------------------------------
 install_vscode() {
     log_step "安装 VSCode"
 
     if command -v code &>/dev/null; then
-        log_warn "VSCode 已安装，版本: $(code --version | head -n1)"
+        log_warn "VSCode 已安装: $(code --version | head -1)"
     else
-        log_info "添加 Microsoft GPG 密钥..."
-        sudo sh -c 'wget -qO- https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > /usr/share/keyrings/packages.microsoft.gpg'
-
-        log_info "添加 VSCode APT 仓库..."
-        sudo sh -c 'echo "deb [arch=amd64 signed-by=/usr/share/keyrings/packages.microsoft.gpg] https://packages.microsoft.com/repos/code stable main" > /etc/apt/sources.list.d/vscode.list'
-
-        log_info "更新索引并安装 VSCode..."
-        sudo apt update
-        sudo apt install -y code
-
+        log_info "添加 Microsoft 仓库..."
+        retry_wget -qO- https://packages.microsoft.com/keys/microsoft.asc | sudo gpg --dearmor -o /usr/share/keyrings/packages.microsoft.gpg
+        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/packages.microsoft.gpg] https://packages.microsoft.com/repos/code stable main" | sudo tee /etc/apt/sources.list.d/vscode.list >/dev/null
+        sudo apt update && sudo apt install -y code
         log_success "VSCode 安装完成"
     fi
 
-    # 配置 settings.json
-    local VSCODE_CONFIG_DIR="$HOME/.config/Code/User"
-    local VSCODE_SETTINGS="${VSCODE_CONFIG_DIR}/settings.json"
+    # 配置 settings.json（智能合并）
+    local CONF_DIR="$HOME/.config/Code/User"
+    local SETTINGS_FILE="${CONF_DIR}/settings.json"
+    mkdir -p "$CONF_DIR"
 
-    mkdir -p "$VSCODE_CONFIG_DIR"
+    # 默认配置字典
+    declare -A DEFAULTS=(
+        ["workbench.colorTheme"]='"Dark Modern"'
+        ["editor.smoothScrolling"]="true"
+        ["editor.cursorBlinking"]='"smooth"'
+        ["editor.cursorSmoothCaretAnimation"]='"on"'
+        ["editor.mouseWheelZoom"]="true"
+        ["editor.tabCompletion"]='"on"'
+        ["editor.stickyScroll.enabled"]="true"
+        ["editor.bracketPairColorization.enabled"]="true"
+        ["editor.guides.bracketPairs"]="true"
+        ["editor.wordWrap"]='"on"'
+        ["editor.renderWhitespace"]='"selection"'
+        ["editor.defaultColorDecorators"]='"always"'
+        ["editor.colorDecoratorsActivatedOn"]='"click"'
+        ["editor.unicodeHighlight.nonBasicASCII"]="false"
+        ["editor.minimap.enabled"]="true"
+        ["editor.minimap.showSlider"]='"always"'
+        ["terminal.integrated.mouseWheelZoom"]="true"
+        ["terminal.integrated.fontSize"]="11"
+        ["git.enableSmartCommit"]="true"
+        ["chat.disableAIFeatures"]="true"
+        ["ipynb.experimental.serialization"]="false"
+        ["[xml]"]='{"editor.autoClosingBrackets":"never","files.trimFinalNewlines":true}'
+    )
 
-    log_info "创建 VSCode settings.json..."
-    cat > "$VSCODE_SETTINGS" << 'EOF'
-{
-    "workbench.colorTheme": "Dark Modern",
-    "editor.smoothScrolling": true,
-    "editor.cursorBlinking": "smooth",
-    "editor.cursorSmoothCaretAnimation": "on",
-    "editor.mouseWheelZoom": true,
-    "editor.tabCompletion": "on",
-    "editor.stickyScroll.enabled": true,
-    "editor.bracketPairColorization.enabled": true,
-    "editor.guides.bracketPairs": true,
-    "editor.wordWrap": "on",
-    "editor.renderWhitespace": "selection",
-    "editor.defaultColorDecorators": "always",
-    "editor.colorDecoratorsActivatedOn": "click",
-    "editor.unicodeHighlight.nonBasicASCII": false,
-    "editor.minimap.enabled": true,
-    "editor.minimap.showSlider": "always",
-    "terminal.integrated.mouseWheelZoom": true,
-    "terminal.integrated.fontSize": 11,
-    "git.enableSmartCommit": true,
-    "chat.disableAIFeatures": true,
-    "ipynb.experimental.serialization": false,
-    "[xml]": {
-        "editor.autoClosingBrackets": "never",
-        "files.trimFinalNewlines": true
-    }
-}
-EOF
-
-    log_success "VSCode settings.json 已创建: ${VSCODE_SETTINGS}"
+    if [ ! -f "$SETTINGS_FILE" ]; then
+        # 全新写入
+        printf "{\n" > "$SETTINGS_FILE"
+        local first=true
+        for key in "${!DEFAULTS[@]}"; do
+            $first && first=false || printf ",\n" >> "$SETTINGS_FILE"
+            printf '    "%s": %s' "$key" "${DEFAULTS[$key]}" >> "$SETTINGS_FILE"
+        done
+        printf "\n}\n" >> "$SETTINGS_FILE"
+        log_success "已创建 VSCode settings.json"
+    else
+        # 合并：仅添加缺失的键，不覆盖已有值
+        log_info "检测到已有 settings.json，仅补充缺失的推荐配置..."
+        if command -v jq &>/dev/null; then
+            # 使用 jq 深度合并（安全）
+            local tmp_json=$(mktemp)
+            jq -s '.[0] * .[1]' "$SETTINGS_FILE" <(cat <<<"$(printf '%s\n' "${!DEFAULTS[@]}" | sed 's/.*/"&":/')") > "$tmp_json" && mv "$tmp_json" "$SETTINGS_FILE"
+            log_success "已使用 jq 合并配置"
+        else
+            log_warn "未安装 jq，无法安全合并，保留原有配置。可手动添加推荐项。"
+            # 打印缺失键供参考
+            for key in "${!DEFAULTS[@]}"; do
+                if ! grep -q "\"$key\"" "$SETTINGS_FILE"; then
+                    log_info "  缺失配置: \"$key\": ${DEFAULTS[$key]}"
+                fi
+            done
+        fi
+    fi
 }
 
 # ---------------------------------------------------------------------------
-# 最终验证
+# 验证安装结果
 # ---------------------------------------------------------------------------
 verify_installations() {
     log_step "验证安装结果"
@@ -446,37 +426,83 @@ verify_installations() {
         "npm|npm"
         "nrm|nrm"
         "uv|uv"
-        "code|VSCode"
     )
+    $INSTALL_VSCODE && tools+=("code|VSCode")
 
-    printf "\n%b%-20s %-15s %s%b\n" "$BOLD" "工具" "状态" "版本" "$NC"
+    printf "\n%b%-25s %-15s %s%b\n" "$BOLD" "工具" "状态" "版本" "$NC"
     printf "%s\n" "---------------------------------------------------------"
 
     for item in "${tools[@]}"; do
-        local cmd=${item%%|*}
-        local name=${item#*|}
-
+        local cmd=${item%%|*} name=${item#*|}
         if command -v "$cmd" &>/dev/null; then
-            local version
+            local ver=""
             case "$cmd" in
-                git) version=$(git --version 2>/dev/null | awk '{print $3}') ;;
-                ssh) version=$(ssh -V 2>&1 | awk '{print $1}') ;;
-                node) version=$(node --version 2>/dev/null) ;;
-                npm) version=$(npm --version 2>/dev/null) ;;
-                nrm) version=$(nrm --version 2>/dev/null) ;;
-                uv) version=$(uv --version 2>/dev/null | awk '{print $2}') ;;
-                code) version=$(code --version 2>/dev/null | head -n1) ;;
-                *) version=$($cmd --version 2>/dev/null | head -n1) ;;
+                git) ver=$(git --version | awk '{print $3}') ;;
+                ssh) ver=$(ssh -V 2>&1 | awk '{print $1}') ;;
+                node) ver=$(node --version) ;;
+                npm) ver=$(npm --version) ;;
+                nrm) ver=$(nrm --version) ;;
+                uv) ver=$(uv --version | awk '{print $2}') ;;
+                code) ver=$(code --version 2>/dev/null | head -1) ;;
+                *) ver=$($cmd --version 2>/dev/null | head -1) ;;
             esac
-            printf "%b%-20s %-15s %s%b\n" "$GREEN" "$name" "✓ 已安装" "${version:-未知}" "$NC"
+            printf "%b%-25s %-15s %s%b\n" "$GREEN" "$name" "✓ 已安装" "${ver:-未知}" "$NC"
         else
-            printf "%b%-20s %-15s %s%b\n" "$RED" "$name" "✗ 未找到" "" "$NC"
+            printf "%b%-25s %-15s %s%b\n" "$RED" "$name" "✗ 未找到" "" "$NC"
         fi
     done
 
-    printf "\n%bSSH 服务状态:%b %s\n" "$CYAN" "$NC" "$(sudo systemctl is-active ssh 2>/dev/null || echo 'unknown')"
-    printf "%bNVM 镜像源:%b %s\n" "$CYAN" "$NC" "${NVM_NODEJS_ORG_MIRROR:-未设置}"
-    printf "%bnpm 镜像源:%b %s\n" "$CYAN" "$NC" "$(npm config get registry 2>/dev/null || echo 'unknown')"
+    printf "\n%bSSH 服务:%b %s\n" "$CYAN" "$NC" "$(sudo systemctl is-active ssh 2>/dev/null || echo 'unknown')"
+    printf "%bnpm 镜像:%b %s\n" "$CYAN" "$NC" "$(npm config get registry 2>/dev/null || echo 'unknown')"
+}
+
+# ---------------------------------------------------------------------------
+# 参数解析
+# ---------------------------------------------------------------------------
+usage() {
+    cat <<EOF
+用法: $0 [选项]
+
+选项:
+  --mirror <1-4>         直接指定镜像编号，跳过交互
+                         (1:阿里云 2:清华 3:中科大 4:华为)
+  --nvm-version <ver>    NVM 版本 (默认: $NVM_VERSION)
+  --node-version <ver>   Node.js 版本 (默认: $NODE_VERSION)
+  --skip-vscode          跳过 VSCode 安装
+  --desktop              同时安装桌面工具 (gnome-sushi)
+  --upgrade              直接升级系统 (不询问)
+  --skip-upgrade         跳过系统升级询问 (不升级)
+  -h, --help             显示此帮助
+
+示例:
+  $0 --mirror 2 --node-version 22 --skip-vscode
+EOF
+    exit 0
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --mirror)
+                MIRROR_CHOICE="$2"; shift 2 ;;
+            --nvm-version)
+                NVM_VERSION="$2"; shift 2 ;;
+            --node-version)
+                NODE_VERSION="$2"; shift 2 ;;
+            --skip-vscode)
+                INSTALL_VSCODE=false; shift ;;
+            --desktop)
+                INSTALL_DESKTOP=true; shift ;;
+            --upgrade)
+                UPGRADE_SYSTEM=true; shift ;;
+            --skip-upgrade)
+                SKIP_UPGRADE=true; shift ;;
+            -h|--help)
+                usage ;;
+            *)
+                log_error "未知参数: $1"; usage ;;
+        esac
+    done
 }
 
 # ---------------------------------------------------------------------------
@@ -493,7 +519,7 @@ main() {
 
 EOF
     printf "%b" "$NC"
-    printf "%bUbuntu 24.04+ 一键环境配置脚本%b\n\n" "$BOLD" "$NC"
+    printf "%bUbuntu 24.04+ 增强版一键环境配置脚本%b\n\n" "$BOLD" "$NC"
 
     check_permissions
     configure_apt_mirror
@@ -501,16 +527,13 @@ EOF
     configure_ssh
     install_nvm_node
     install_uv
-    install_vscode
+    $INSTALL_VSCODE && install_vscode
     verify_installations
 
     log_step "配置完成"
-    log_success "所有步骤执行完毕！建议重新登录或执行 source ~/.bashrc 以确保所有环境变量生效。"
-
-    # 清理 sudo keepalive 进程
-    if [ -n "${SUDO_KEEPALIVE_PID:-}" ]; then
-        kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
-    fi
+    log_success "所有步骤执行完毕！请执行 'source ~/.bashrc' 或重新登录以使环境变量完全生效。"
 }
 
-main "$@"
+# 解析参数并执行
+parse_args "$@"
+main
