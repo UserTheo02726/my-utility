@@ -61,7 +61,7 @@ echo -e "\n${GREEN}=== 定制安装选项 (回车默认) ===${NC}"
 DO_UPGRADE=false; DO_SSH=false; DO_FASTFETCH=false
 DO_NODE=false; DO_UV=false; DO_VSCODE=false; DO_CHROME=false
 
-ask "执行系统升级 (apt upgrade)" "N" && DO_UPGRADE=true
+ask "执行系统升级 (耗时较长, apt upgrade)" "N" && DO_UPGRADE=true
 if ! $IS_WSL && ! $IS_ORBSTACK; then ask "安装并配置 SSH 服务" "Y" && DO_SSH=true; fi
 ask "安装 fastfetch 系统信息" "Y" && DO_FASTFETCH=true
 ask "安装 NVM & Node.js 24" "Y" && DO_NODE=true
@@ -73,25 +73,27 @@ fi
 
 echo -e "\n${GREEN}=== 开始全自动配置 (可离开终端) ===${NC}"
 
-# --- 1. APT 测速与替换 ---
-info "寻找最优 APT 镜像源..."
+# --- 1. 前置依赖：必须执行换源与基础包，否则后续 VSCode/NVM 无法下载 ---
+info "准备前置依赖：配置 APT 加速源并刷新列表..."
 APT_MIRRORS="http://archive.ubuntu.com/ubuntu/ http://mirrors.aliyun.com/ubuntu/ http://mirrors.tuna.tsinghua.edu.cn/ubuntu/ http://mirrors.ustc.edu.cn/ubuntu/"
 BEST_APT=$(get_fastest_mirror "$APT_MIRRORS")
 BEST_APT_HOST=$(echo "$BEST_APT" | awk -F/ '{print $3}')
-info "锁定 APT 源: $BEST_APT_HOST"
 
 SRC="/etc/apt/sources.list.d/ubuntu.sources"; [ ! -f "$SRC" ] && SRC="/etc/apt/sources.list"
 sudo cp --update=none "$SRC" "${SRC}.bak" || true
 sudo sed -i -E "s/(archive\.ubuntu\.com|security\.ubuntu\.com|mirrors\.aliyun\.com|mirrors\.tuna\.tsinghua\.edu\.cn|mirrors\.ustc\.edu\.cn)/$BEST_APT_HOST/g" "$SRC"
 
 sudo DEBIAN_FRONTEND=noninteractive apt-get update -y || warn "apt update 存在警告"
-$DO_UPGRADE && { info "执行系统升级..."; sudo DEBIAN_FRONTEND=noninteractive apt-get upgrade -y; }
 
-# --- 2. 基础组件 ---
-info "安装基础工具链..."
+if $DO_UPGRADE; then
+    info "正在执行系统全局升级..."
+    sudo DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
+fi
+
+info "准备前置依赖：补齐 curl/wget 等基础下载与编译工具..."
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git curl wget build-essential unzip tar ca-certificates btop jq tmux
 
-# --- 3. 可选组件部署 ---
+# --- 3. 业务组件部署 ---
 if $DO_FASTFETCH; then
     info "部署 fastfetch..."
     if awk "BEGIN {exit !($UBUNTU_VER <= 24.04)}"; then
@@ -114,6 +116,11 @@ if $DO_NODE; then
     BEST_NVM=$(get_fastest_mirror "$NVM_MIRRORS")
     BEST_NPM=$(get_fastest_mirror "$NPM_MIRRORS")
     
+    if [ -d "$HOME/.nvm" ] && [ ! -s "$HOME/.nvm/nvm.sh" ]; then
+        warn "检测到残缺的 NVM 安装残留，正在自动清理..."
+        rm -rf "$HOME/.nvm"
+    fi
+
     if [ ! -d "$HOME/.nvm" ]; then
         info "调用 nvm-cn 国内镜像安装脚本..."
         # 来自："https://gitee.com/RubyMetric/nvm-cn"
@@ -125,16 +132,19 @@ if $DO_NODE; then
     echo "export NVM_NODEJS_ORG_MIRROR=$BEST_NVM" >> "$HOME/.bashrc"
     export NVM_NODEJS_ORG_MIRROR=$BEST_NVM
 
+    set +euo pipefail
     export NVM_DIR="$HOME/.nvm"
-    set +u
-    [ -s "$NVM_DIR/nvm.sh" ] && source "$NVM_DIR/nvm.sh"
-    [ -s "$NVM_DIR/bash_completion" ] && source "$NVM_DIR/bash_completion"
-    
-    nvm install 24 && nvm alias default 24
-    npm config set registry "$BEST_NPM"
-    npm install -g nrm
-    
-    set -u
+    if [ -s "$NVM_DIR/nvm.sh" ]; then
+        source "$NVM_DIR/nvm.sh"
+        [ -s "$NVM_DIR/bash_completion" ] && source "$NVM_DIR/bash_completion"
+        
+        nvm install 24 && nvm alias default 24
+        npm config set registry "$BEST_NPM"
+        npm install -g nrm
+    else
+        err "NVM 核心文件缺失，拉取环境失败！"
+    fi
+    set -euo pipefail
 fi
 
 if $DO_UV; then
