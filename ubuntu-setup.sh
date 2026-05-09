@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Ubuntu 24.04+ 一键环境配置脚本（无脑轻薄版）
-# 特性：镜像自动选、基础工具、NVM/Node、uv、VSCode
-#       修复 sudo 进程残留、网络重试、VSCode 配置不覆盖
+# Ubuntu 24.04+ 一键环境配置（无脑轻便 + 组件选择）
+# 特性：whiptail 菜单自选组件、安全清理、网络重试、智能不覆盖
 # =============================================================================
 set -euo pipefail
 
@@ -16,7 +15,7 @@ log_warn()    { printf "%b[WARN]%b %s\n" "$YELLOW" "$NC" "$1"; }
 log_error()   { printf "%b[ERROR]%b %s\n" "$RED" "$NC" "$1"; }
 log_step()    { printf "\n%b========== %s ==========%b\n" "$BOLD" "$1" "$NC"; }
 
-# ---------- 资源清理（确保 sudo 保持进程被杀死） ----------
+# ---------- 资源清理 ----------
 SUDO_KEEPALIVE_PID=""
 cleanup() {
     [ -n "${SUDO_KEEPALIVE_PID:-}" ] && kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
@@ -29,26 +28,136 @@ cleanup_on_error() {
 }
 trap 'cleanup_on_error $LINENO' ERR
 
-# ---------- 静默重试的网络下载 ----------
+# ---------- 网络重试 ----------
 curl_retry() { curl --retry 3 --retry-delay 2 --retry-connrefused -sSL "$@"; }
 wget_retry() { wget --tries=3 --retry-connrefused -q "$@"; }
 
-# ---------- 权限检查 ----------
+# ---------- 权限 ----------
 check_permissions() {
     log_step "检查运行权限"
-    [ "$(id -u)" -eq 0 ] && { log_error "请勿以 root 运行此脚本。"; exit 1; }
+    [ "$(id -u)" -eq 0 ] && { log_error "请勿以 root 运行。"; exit 1; }
     log_info "当前用户: $(whoami)"
     if ! sudo -n true 2>/dev/null; then
         log_warn "需要 sudo 权限，请输入当前用户密码："
         sudo -v || { log_error "sudo 认证失败"; exit 1; }
     fi
-    # 静默保持 sudo 会话
     while true; do sudo -n true; sleep 60; done 2>/dev/null &
     SUDO_KEEPALIVE_PID=$!
     log_success "sudo 权限验证通过"
 }
 
-# ---------- APT 镜像源（交互 + 超时） ----------
+# ---------- 组件选择菜单 ----------
+select_components() {
+    log_step "选择要安装的组件"
+
+    # 必须安装的基础工具在菜单外说明，此处只列可选组件
+    local choices
+    local title="安装组件选择"
+    local menu_text="使用 上下键 移动，空格 选择/取消，回车 确认。\n基础工具 (git,curl,wget...) 将强制安装。"
+
+    # 检查 whiptail / dialog 是否存在
+    if command -v whiptail &>/dev/null; then
+        # whiptail checklist: 每个条目 "tag" "描述" "初始状态"
+        choices=$(whiptail --title "$title" --checklist "$menu_text" 20 78 10 \
+            "system_upgrade" "执行系统升级 (apt upgrade)" OFF \
+            "ssh" "SSH 服务 (openssh-server + 防火墙)" ON \
+            "fastfetch" "fastfetch 系统信息" ON \
+            "gnome_sushi" "gnome-sushi 文件预览 (桌面)" ON \
+            "nvm_node" "NVM & Node.js v24" ON \
+            "uv" "uv Python 包管理器" ON \
+            "vscode" "Visual Studio Code" ON \
+            "chrome" "Google Chrome 浏览器" ON \
+            3>&1 1>&2 2>&3)
+        # 如果没有选择，whiptail 返回非零，则视为全部不选（除了基础工具）
+        if [ $? -ne 0 ]; then
+            choices=""
+        fi
+    elif command -v dialog &>/dev/null; then
+        choices=$(dialog --stdout --title "$title" --checklist "$menu_text" 20 78 10 \
+            "system_upgrade" "执行系统升级 (apt upgrade)" OFF \
+            "ssh" "SSH 服务 (openssh-server + 防火墙)" ON \
+            "fastfetch" "fastfetch 系统信息" ON \
+            "gnome_sushi" "gnome-sushi 文件预览 (桌面)" ON \
+            "nvm_node" "NVM & Node.js v24" ON \
+            "uv" "uv Python 包管理器" ON \
+            "vscode" "Visual Studio Code" ON \
+            "chrome" "Google Chrome 浏览器" ON)
+    else
+        # 回退：简单数字输入
+        log_warn "未找到 whiptail 或 dialog，使用简单选择模式。"
+        echo "可选组件："
+        echo " 1) 系统升级"
+        echo " 2) SSH 服务"
+        echo " 3) fastfetch"
+        echo " 4) gnome-sushi"
+        echo " 5) NVM & Node.js"
+        echo " 6) uv"
+        echo " 7) VSCode"
+        echo " 8) Chrome"
+        printf "输入要安装的编号（空格分隔，如 2 5 6），直接回车则全部安装："
+        read -r raw
+        # 转换为标签
+        choices=""
+        for num in $raw; do
+            case $num in
+                1) choices+=" system_upgrade";;
+                2) choices+=" ssh";;
+                3) choices+=" fastfetch";;
+                4) choices+=" gnome_sushi";;
+                5) choices+=" nvm_node";;
+                6) choices+=" uv";;
+                7) choices+=" vscode";;
+                8) choices+=" chrome";;
+            esac
+        done
+        if [ -z "$raw" ]; then
+            choices="system_upgrade ssh fastfetch gnome_sushi nvm_node uv vscode chrome"
+            log_info "未输入，默认全部安装"
+        fi
+    fi
+
+    # 初始化所有为 false
+    INSTALL_SSH=false
+    INSTALL_FASTFETCH=false
+    INSTALL_GNOME_SUSHI=false
+    INSTALL_NVM_NODE=false
+    INSTALL_UV=false
+    INSTALL_VSCODE=false
+    INSTALL_CHROME=false
+    SYSTEM_UPGRADE=false
+
+    # 解析选择
+    # whiptail/dialog 输出格式：每个选中项双引号包围，换行分隔
+    # 去除所有双引号，逐行读取
+    while IFS= read -r tag; do
+        case "$tag" in
+            system_upgrade) SYSTEM_UPGRADE=true ;;
+            ssh) INSTALL_SSH=true ;;
+            fastfetch) INSTALL_FASTFETCH=true ;;
+            gnome_sushi) INSTALL_GNOME_SUSHI=true ;;
+            nvm_node) INSTALL_NVM_NODE=true ;;
+            uv) INSTALL_UV=true ;;
+            vscode) INSTALL_VSCODE=true ;;
+            chrome) INSTALL_CHROME=true ;;
+        esac
+    done < <(echo "$choices" | tr -d '"' | grep -v '^$')
+
+    # 输出选择摘要
+    echo ""
+    log_info "你的选择："
+    [ "$SYSTEM_UPGRADE" = true ] && log_info "  ✓ 系统升级"
+    [ "$INSTALL_SSH" = true ] && log_info "  ✓ SSH 服务"
+    [ "$INSTALL_FASTFETCH" = true ] && log_info "  ✓ fastfetch"
+    [ "$INSTALL_GNOME_SUSHI" = true ] && log_info "  ✓ gnome-sushi"
+    [ "$INSTALL_NVM_NODE" = true ] && log_info "  ✓ NVM & Node.js"
+    [ "$INSTALL_UV" = true ] && log_info "  ✓ uv"
+    [ "$INSTALL_VSCODE" = true ] && log_info "  ✓ VSCode"
+    [ "$INSTALL_CHROME" = true ] && log_info "  ✓ Chrome"
+    echo ""
+    sleep 1
+}
+
+# ---------- 镜像源 ----------
 configure_apt_mirror() {
     log_step "配置 APT 镜像源"
     local SRC="/etc/apt/sources.list.d/ubuntu.sources"
@@ -95,34 +204,28 @@ configure_apt_mirror() {
     log_success "镜像源已更新"
 
     sudo apt update || { log_error "apt update 失败"; exit 1; }
-    log_success "软件包索引更新完成"
 
-    # 系统升级询问
-    log_info "是否升级系统包？(y/N，10s 超时默认 N)"
-    local up=""
-    IFS= read -r -t 10 up </dev/tty 2>/dev/null || true
-    if [[ "$up" =~ ^[Yy]$ ]]; then
+    if $SYSTEM_UPGRADE; then
+        log_info "正在执行系统升级..."
         sudo apt upgrade -y && log_success "系统升级完成"
     else
-        log_info "跳过系统升级"
+        log_info "已跳过系统升级"
     fi
 }
 
-# ---------- 基础工具（智能检测包是否存在） ----------
+# ---------- 基础工具（强制安装） ----------
 install_base_tools() {
     log_step "安装基础工具"
-    local pkgs=(git curl wget openssh-server build-essential unzip tar)
-    # 检测可选包
-    apt-cache show fastfetch &>/dev/null && pkgs+=(fastfetch) || log_warn "fastfetch 不在源中，跳过"
-    apt-cache show gnome-sushi &>/dev/null && pkgs+=(gnome-sushi) || log_warn "gnome-sushi 不在源中，跳过"
+    local pkgs=(git curl wget build-essential unzip tar)
     log_info "安装: ${pkgs[*]}"
     sudo apt install -y "${pkgs[@]}"
     log_success "基础工具安装完成"
 }
 
-# ---------- SSH 服务 ----------
-configure_ssh() {
+# ---------- SSH ----------
+install_ssh() {
     log_step "配置 SSH"
+    sudo apt install -y openssh-server
     sudo systemctl start ssh || true
     sudo systemctl enable ssh 2>/dev/null || true
     if command -v ufw &>/dev/null && sudo ufw status | grep -q "Status: active"; then
@@ -136,7 +239,19 @@ configure_ssh() {
     log_success "SSH 已配置（状态: $(systemctl is-active ssh)）"
 }
 
-# ---------- NVM / Node.js ----------
+# ---------- fastfetch ----------
+install_fastfetch() {
+    log_info "安装 fastfetch..."
+    sudo apt install -y fastfetch && log_success "fastfetch 安装完成" || log_warn "fastfetch 安装失败"
+}
+
+# ---------- gnome-sushi ----------
+install_gnome_sushi() {
+    log_info "安装 gnome-sushi..."
+    sudo apt install -y gnome-sushi && log_success "gnome-sushi 安装完成" || log_warn "gnome-sushi 安装失败"
+}
+
+# ---------- NVM / Node ----------
 install_nvm_node() {
     log_step "安装 NVM 与 Node.js"
     if [ ! -d "$HOME/.nvm" ]; then
@@ -183,7 +298,7 @@ install_uv() {
     command -v uv &>/dev/null && log_success "uv $(uv --version)" || log_warn "uv 未在 PATH 中，请执行 source ~/.bashrc"
 }
 
-# ---------- VSCode（已有配置自动备份，不覆盖） ----------
+# ---------- VSCode ----------
 install_vscode() {
     log_step "安装 VSCode"
     if command -v code &>/dev/null; then
@@ -199,7 +314,6 @@ install_vscode() {
     local SET="$DIR/settings.json"
     mkdir -p "$DIR"
     if [ -f "$SET" ]; then
-        # 智能处理：备份旧文件，再写入推荐配置
         cp "$SET" "${SET}.bak"
         log_warn "已有 settings.json 已备份为 settings.json.bak，现写入推荐配置"
     fi
@@ -235,59 +349,102 @@ EOF
     log_success "VSCode 配置已写入"
 }
 
+# ---------- Chrome ----------
+install_chrome() {
+    log_step "安装 Google Chrome"
+    if command -v google-chrome &>/dev/null; then
+        log_warn "Chrome 已安装"
+        return
+    fi
+    local TMP_DEB="/tmp/google-chrome.deb"
+    wget_retry -O "$TMP_DEB" https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+    sudo apt install -y "$TMP_DEB"
+    rm -f "$TMP_DEB"
+    log_success "Chrome 安装完成"
+}
+
 # ---------- 验证 ----------
 verify_installations() {
-    log_step "验证安装"
-    local tools=(
-        "git|Git" "curl|cURL" "wget|Wget" "ssh|OpenSSH"
-        "fastfetch|Fastfetch" "node|Node.js" "npm|npm" "nrm|nrm"
-        "uv|uv" "code|VSCode"
+    log_step "安装结果"
+
+    # 定义检查列表：命令，显示名称，是否安装的变量
+    declare -A CHECKS=(
+        ["git"]="Git|true"
+        ["curl"]="cURL|true"
+        ["wget"]="Wget|true"
+        ["ssh"]="SSH|$INSTALL_SSH"
+        ["fastfetch"]="Fastfetch|$INSTALL_FASTFETCH"
+        ["gnome-sushi"]="gnome-sushi|$INSTALL_GNOME_SUSHI"
+        ["node"]="Node.js|$INSTALL_NVM_NODE"
+        ["npm"]="npm|$INSTALL_NVM_NODE"
+        ["nrm"]="nrm|$INSTALL_NVM_NODE"
+        ["uv"]="uv|$INSTALL_UV"
+        ["code"]="VSCode|$INSTALL_VSCODE"
+        ["google-chrome"]="Chrome|$INSTALL_CHROME"
     )
+
     printf "\n%b%-20s %-15s %s%b\n" "$BOLD" "工具" "状态" "版本" "$NC"
-    printf "%s\n" "----------------------------------------------"
-    for t in "${tools[@]}"; do
-        local cmd=${t%%|*} name=${t#*|} ver=""
-        if command -v "$cmd" &>/dev/null; then
-            case "$cmd" in
-                git) ver=$(git --version | awk '{print $3}');;
-                ssh) ver=$(ssh -V 2>&1 | awk '{print $1}');;
-                node) ver=$(node -v);;
-                npm) ver=$(npm -v);;
-                nrm) ver=$(nrm --version 2>/dev/null);;
-                uv) ver=$(uv --version | awk '{print $2}');;
-                code) ver=$(code --version 2>/dev/null | head -1);;
-                *) ver=$($cmd --version 2>/dev/null | head -1);;
-            esac
-            printf "%b%-20s %-15s %s%b\n" "$GREEN" "$name" "✓已安装" "${ver:-未知}" "$NC"
+    printf "%s\n" "--------------------------------------------------"
+    for cmd in "${!CHECKS[@]}"; do
+        IFS='|' read -r name should_install <<< "${CHECKS[$cmd]}"
+        if $should_install; then
+            if command -v "$cmd" &>/dev/null; then
+                local ver=""
+                case "$cmd" in
+                    git) ver=$(git --version | awk '{print $3}');;
+                    ssh) ver=$(ssh -V 2>&1 | awk '{print $1}');;
+                    node) ver=$(node -v);;
+                    npm) ver=$(npm -v);;
+                    nrm) ver=$(nrm --version 2>/dev/null);;
+                    uv) ver=$(uv --version | awk '{print $2}');;
+                    code) ver=$(code --version 2>/dev/null | head -1);;
+                    google-chrome) ver=$(google-chrome --version 2>/dev/null | awk '{print $3}');;
+                    *) ver=$($cmd --version 2>/dev/null | head -1);;
+                esac
+                printf "%b%-20s %-15s %s%b\n" "$GREEN" "$name" "✓ 已安装" "${ver:-未知}" "$NC"
+            else
+                printf "%b%-20s %-15s %s%b\n" "$RED" "$name" "✗ 未找到" "" "$NC"
+            fi
         else
-            printf "%b%-20s %-15s %s%b\n" "$RED" "$name" "✗未找到" "" "$NC"
+            printf "%b%-20s %-15s %s%b\n" "$YELLOW" "$name" "⏭ 已跳过" "-" "$NC"
         fi
     done
-    printf "\n%bSSH:%b %s | %bnpm源:%b %s\n" \
-        "$CYAN" "$NC" "$(sudo systemctl is-active ssh)" \
-        "$CYAN" "$NC" "$(npm config get registry 2>/dev/null || echo 'unknown')"
+
+    echo ""
+    printf "%b系统升级:%b %s\n" "$CYAN" "$NC" "$($SYSTEM_UPGRADE && echo '已执行' || echo '已跳过')"
 }
 
 # ---------- 主流程 ----------
 main() {
     printf "%b\n" "$CYAN"
-    cat << 'EOF'
-   _    _ _                 _   _       _       _   _
-  / \  | | | ___  _   _  __| | | | ___ | |_ ___| | | |
- / _ \ | | |/ _ \| | | |/ _` | | |/ _ \| __/ _ \ | | |
-/ ___ \| | | (_) | |_| | (_| | | | (_) | ||  __/ |_| |
-/_/   \_\_|_|\___/ \__,_|\__,_| |_|\___/ \__\___|\___|
+cat << 'EOF'
+▄▄▄█████▓ ██░ ██ ▓█████  ▒█████
+▓  ██▒ ▓▒▓██░ ██▒▓█   ▀ ▒██▒  ██▒
+▒ ▓██░ ▒░▒██▀▀██░▒███   ▒██░  ██▒
+░ ▓██▓ ░ ░▓█ ░██ ▒▓█  ▄ ▒██   ██░
+  ▒██▒ ░ ░▓█▒░██▓░▒████▒░ ████▓▒░
+  ▒ ░░    ▒ ░░▒░▒░░ ▒░ ░░ ▒░▒░▒░
+    ░     ▒ ░▒░ ░ ░ ░  ░  ░ ▒ ▒░
+  ░       ░  ░░ ░   ░   ░ ░ ░ ▒
+          ░  ░  ░   ░  ░    ░ ░
+
 EOF
     printf "%b" "$NC"
-    printf "%bUbuntu 24.04+ 一键环境配置（无脑轻薄版）%b\n\n" "$BOLD" "$NC"
+    printf "%bUbuntu 24.04+ 一键环境配置（组件选择版）%b\n\n" "$BOLD" "$NC"
 
     check_permissions
+    select_components
     configure_apt_mirror
     install_base_tools
-    configure_ssh
-    install_nvm_node
-    install_uv
-    install_vscode
+
+    $INSTALL_SSH && install_ssh
+    $INSTALL_FASTFETCH && install_fastfetch
+    $INSTALL_GNOME_SUSHI && install_gnome_sushi
+    $INSTALL_NVM_NODE && install_nvm_node
+    $INSTALL_UV && install_uv
+    $INSTALL_VSCODE && install_vscode
+    $INSTALL_CHROME && install_chrome
+
     verify_installations
 
     log_step "全部完成！"
