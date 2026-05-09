@@ -1,7 +1,4 @@
 #!/usr/bin/env bash
-# =============================================================================
-# Ubuntu 24.04+ 一键环境配置 (v6 - 纯文本流式交互 + VSCode定制版)
-# =============================================================================
 set -euo pipefail
 
 GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -28,24 +25,44 @@ echo -e "\n${GREEN}=== 系统环境预检 ===${NC}"
 UBUNTU_VER=$(grep -oP '(?<=^VERSION_ID=")[^"]+' /etc/os-release)
 ARCH=$(uname -m); DEB_ARCH="amd64"; [ "$ARCH" = "aarch64" ] && DEB_ARCH="arm64"
 
-IS_WSL=false; grep -qi microsoft /proc/version 2>/dev/null && IS_WSL=true
-HAS_NVIDIA=false; (command -v nvidia-smi >/dev/null 2>&1 || [ -f /usr/lib/wsl/lib/libcuda.so ]) && HAS_NVIDIA=true
+# --- 核心：多端环境精准侦测 ---
+ENV_TYPE="Server"
+IS_WSL=false; IS_ORBSTACK=false; IS_DESKTOP=false
 
-echo "系统: Ubuntu $UBUNTU_VER | 架构: $ARCH | WSL: $IS_WSL | GPU: $HAS_NVIDIA"
+if uname -a | grep -qi "orbstack"; then
+    ENV_TYPE="OrbStack"
+    IS_ORBSTACK=true
+elif grep -qi microsoft /proc/version 2>/dev/null || [ -n "${WSL_DISTRO_NAME:-}" ]; then
+    ENV_TYPE="WSL"
+    IS_WSL=true
+# 检查是否安装了桌面环境的基础包
+elif dpkg-query -W -f='${Status}' ubuntu-desktop 2>/dev/null | grep -q "ok installed" || \
+     dpkg-query -W -f='${Status}' ubuntu-desktop-minimal 2>/dev/null | grep -q "ok installed"; then
+    ENV_TYPE="Desktop"
+    IS_DESKTOP=true
+fi
+
+echo "系统: Ubuntu $UBUNTU_VER | 架构: $ARCH | 环境: $ENV_TYPE"
 
 echo -e "\n${GREEN}=== 定制安装选项 (回车默认) ===${NC}"
 # 声明变量保存用户选择
 DO_UPGRADE=false; DO_SSH=false; DO_FASTFETCH=false
-DO_NODE=false; DO_UV=false; DO_VSCODE=false; DO_CHROME=false; DO_NVCTK=false
+DO_NODE=false; DO_UV=false; DO_VSCODE=false; DO_CHROME=false
 
 ask "执行系统升级 (apt upgrade)" "N" && DO_UPGRADE=true
-if ! $IS_WSL; then ask "安装并配置 SSH 服务" "Y" && DO_SSH=true; fi
+
+# 智能拦截：只在标准 Server 或 Desktop 环境下才询问/安装 SSH
+if ! $IS_WSL && ! $IS_ORBSTACK; then ask "安装并配置 SSH 服务" "Y" && DO_SSH=true; fi
+
 ask "安装 fastfetch 系统信息" "Y" && DO_FASTFETCH=true
 ask "安装 NVM & Node.js 24" "Y" && DO_NODE=true
 ask "安装 uv (Python包管理器)" "Y" && DO_UV=true
-ask "安装 Visual Studio Code" "Y" && DO_VSCODE=true
-[ "$DEB_ARCH" != "arm64" ] && ask "安装 Google Chrome" "Y" && DO_CHROME=true
-$HAS_NVIDIA && ask "安装 NVIDIA Container Toolkit (Docker GPU支持)" "Y" && DO_NVCTK=true
+
+# 智能拦截：桌面环境或 WSL(依托 WSLg) 允许安装 GUI 应用
+if $IS_DESKTOP || $IS_WSL; then
+    ask "安装 Visual Studio Code" "Y" && DO_VSCODE=true
+    [ "$DEB_ARCH" != "arm64" ] && ask "安装 Google Chrome" "Y" && DO_CHROME=true
+fi
 
 echo -e "\n${GREEN}=== 开始全自动配置 (可离开终端) ===${NC}"
 
@@ -66,8 +83,8 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get update -y || warn "apt update 存在
 $DO_UPGRADE && { info "执行系统升级..."; sudo DEBIAN_FRONTEND=noninteractive apt-get upgrade -y; }
 
 # --- 2. 基础组件 ---
-info "安装基础工具 (git/curl/wget/build-essential)..."
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git curl wget build-essential unzip tar ca-certificates
+info "安装基础工具链..."
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git curl wget build-essential unzip tar ca-certificates btop jq tmux
 
 # --- 3. 可选组件部署 ---
 if $DO_FASTFETCH; then
@@ -80,16 +97,6 @@ if $DO_SSH; then
     info "部署 SSH 服务..."
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server
     command -v ufw >/dev/null && { sudo ufw allow 22/tcp >/dev/null || true; }
-fi
-
-if $DO_NVCTK; then
-    info "部署 NVIDIA Container Toolkit..."
-    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-    curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
-        sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
-        sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
-    sudo apt-get update -y && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nvidia-container-toolkit
-    command -v docker >/dev/null && sudo nvidia-ctk runtime configure --runtime=docker || true
 fi
 
 if $DO_NODE; then
