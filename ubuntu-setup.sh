@@ -115,8 +115,9 @@ if $DO_NODE; then
     BEST_NPM=$(get_fastest_mirror "$NPM_MIRRORS")
     
     if [ ! -d "$HOME/.nvm" ]; then
-        info "调用 NVM 官方安装脚本..."
-        curl -sL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.4/install.sh | bash
+        info "调用 NVM 镜像安装脚本..."
+        # 来自："https://gitee.com/RubyMetric/nvm-cn"
+        bash -c "$(curl -fsSL https://gitee.com/RubyMetric/nvm-cn/raw/main/install.sh)"
         export NVM_DIR="$HOME/.nvm"
         [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
     fi
