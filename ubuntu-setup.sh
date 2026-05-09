@@ -115,20 +115,26 @@ if $DO_NODE; then
     BEST_NPM=$(get_fastest_mirror "$NPM_MIRRORS")
     
     if [ ! -d "$HOME/.nvm" ]; then
-        info "调用 NVM 镜像安装脚本..."
+        info "调用 nvm-cn 国内镜像安装脚本..."
         # 来自："https://gitee.com/RubyMetric/nvm-cn"
         bash -c "$(curl -fsSL https://gitee.com/RubyMetric/nvm-cn/raw/main/install.sh)"
-        export NVM_DIR="$HOME/.nvm"
-        [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
     fi
     
+    info "配置 NVM 镜像并应用环境..."
     sed -i '/^export NVM_NODEJS_ORG_MIRROR=/d' "$HOME/.bashrc"
     echo "export NVM_NODEJS_ORG_MIRROR=$BEST_NVM" >> "$HOME/.bashrc"
     export NVM_NODEJS_ORG_MIRROR=$BEST_NVM
 
+    export NVM_DIR="$HOME/.nvm"
+    set +u
+    [ -s "$NVM_DIR/nvm.sh" ] && source "$NVM_DIR/nvm.sh"
+    [ -s "$NVM_DIR/bash_completion" ] && source "$NVM_DIR/bash_completion"
+    
     nvm install 24 && nvm alias default 24
     npm config set registry "$BEST_NPM"
     npm install -g nrm
+    
+    set -u
 fi
 
 if $DO_UV; then
