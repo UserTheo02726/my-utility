@@ -58,11 +58,10 @@ fi
 echo "系统: Ubuntu $UBUNTU_VER | 架构: $ARCH | 环境: $ENV_TYPE"
 
 echo -e "\n${GREEN}=== 定制安装选项 (回车默认) ===${NC}"
-DO_UPGRADE=false; DO_SSH=false; DO_FASTFETCH=false
+DO_UPGRADE=false; DO_FASTFETCH=false
 DO_NODE=false; DO_UV=false; DO_VSCODE=false; DO_CHROME=false
 
 ask "执行系统升级 (耗时较长, apt upgrade)" "N" && DO_UPGRADE=true
-if ! $IS_WSL && ! $IS_ORBSTACK; then ask "安装并配置 SSH 服务" "Y" && DO_SSH=true; fi
 ask "安装 fastfetch 系统信息" "Y" && DO_FASTFETCH=true
 ask "安装 NVM & Node.js 24" "Y" && DO_NODE=true
 ask "安装 uv (Python包管理器)" "Y" && DO_UV=true
@@ -102,13 +101,6 @@ if $DO_FASTFETCH; then
         sudo apt-get update -y
     fi
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y fastfetch || true
-fi
-
-if $DO_SSH; then
-    info "部署 SSH 服务..."
-    # 强制同时解析 server 和 client
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server openssh-client
-    command -v ufw >/dev/null && { sudo ufw allow 22/tcp >/dev/null || true; }
 fi
 
 if $DO_NODE; then
