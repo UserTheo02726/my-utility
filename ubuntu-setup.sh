@@ -104,10 +104,18 @@ if $DO_NODE; then
         curl -sL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.4/install.sh | bash
         export NVM_DIR="$HOME/.nvm"
         [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+        
+        # 将 NVM 镜像源持久化写入 .bashrc
+        if ! grep -q "NVM_NODEJS_ORG_MIRROR" "$HOME/.bashrc"; then
+            echo -e '\n# nvm配置国内镜像（加速下载 Node.js）\nexport NVM_NODEJS_ORG_MIRROR=https://npmmirror.com/mirrors/node' >> "$HOME/.bashrc"
+        fi
+        
         export NVM_NODEJS_ORG_MIRROR=https://npmmirror.com/mirrors/node
         nvm install 24 && nvm alias default 24
         npm config set registry https://registry.npmmirror.com
         npm install -g nrm
+    else
+        warn "NVM 已存在，跳过安装"
     fi
 fi
 
@@ -119,7 +127,8 @@ fi
 if $DO_VSCODE; then
     info "部署 VSCode..."
     if ! command -v code >/dev/null; then
-        wget -qO- https://packages.microsoft.com/keys/microsoft.asc | sudo gpg --dearmor -y -o /usr/share/keyrings/packages.microsoft.gpg
+        # 修正 gpg 的 --yes 参数
+        wget -qO- https://packages.microsoft.com/keys/microsoft.asc | sudo gpg --dearmor --yes -o /usr/share/keyrings/packages.microsoft.gpg
         echo "deb [arch=$DEB_ARCH signed-by=/usr/share/keyrings/packages.microsoft.gpg] https://packages.microsoft.com/repos/code stable main" | sudo tee /etc/apt/sources.list.d/vscode.list >/dev/null
         sudo apt-get update -y && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y code
     fi
